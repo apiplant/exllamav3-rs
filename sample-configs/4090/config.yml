@@ -1,0 +1,63 @@
+# Sample config for a single 24 GB card (RTX 3090 / 4090), tuned for the
+# Qwen3.8-27B hybrid model at 4.0bpw. See `sample-configs/config.example.yml`
+# for a fully commented explanation of every key. Run:
+#
+#   ./run-server.sh --config sample-configs/4090/config.yml --host 0.0.0.0
+#
+# Point `model.model_dir` / `model_name` at whichever of the two models in the
+# quickstart you downloaded — see the README "Quickstart: 3090/4090" section.
+
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: true
+  sse_ping_interval: 15
+
+logging:
+  log_requests: false
+
+model:
+  model_dir: /mnt/extra/projects/exllamav3-rs/models
+  # Either:
+  #   Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw               (calibrated on agentic traces)
+  #   Honkware/Qwen3.8-27B-heretic-ara-exl3-4.0bpw     (heretic-ARA, uncensored)
+  model_name: Honkware/Qwen3.8-27B-heretic-ara-exl3-4.0bpw
+
+  # 27B-4bit + mtp + vision + a 32k Q4 pool leaves comfortable headroom on 24 GB;
+  # see config.example.yml's VRAM note for how this is sized and the knobs
+  # (EXL3_MAX_CACHE, EXL3_VRAM_RESERVE_MB) if it doesn't fit on your card.
+  max_seq_len: 32768
+  cache_size: 32768
+  cache_mode: Q4
+
+  chunk_size: 2048
+  prefix_cache: true
+  max_batch_size:
+
+  rope_scale: 1.0
+  rope_alpha:
+
+  vision: true
+
+  reasoning: true
+  reasoning_start_token: "<think>"
+  reasoning_end_token: "</think>"
+  start_in_reasoning: auto
+
+  template_vars_default: {}
+  template_vars_force: {}
+
+  tool_format: qwen3_coder
+
+draft_model:
+  # self-speculative decode — ~2x on this model, ~free on a 24 GB card since the
+  # MTP head is already loaded with the weights.
+  draft_mode: mtp
+  draft_num_tokens: 4
+  ngram_match_min: 2
+
+sampling:
+  override_preset: safe_defaults
+
+developer:
+  disable_request_streaming: false

@@ -1,0 +1,52 @@
+[package]
+name = "exllamav3-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of ExLlamaV3 — EXL3 quantized LLM inference with the original CUDA kernels"
+license = "MIT"
+
+[lib]
+name = "exl3"
+path = "src/lib.rs"
+
+[[bin]]
+name = "infer"
+path = "src/bin/infer.rs"
+
+[[bin]]
+name = "gen"
+path = "src/bin/gen.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "attn_check"
+path = "src/bin/attn_check.rs"
+
+[dependencies]
+tch = "0.26"
+torch-sys = "0.26"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+memmap2 = "0.9"
+half = "2"
+clap = { version = "4", features = ["derive"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+serde_yaml_ng = "0.10"
+ntex = { version = "2.18", features = ["tokio"] }
+flume = "0.11"
+tokio = { version = "1", default-features = false, features = ["signal", "macros", "rt", "sync"] }
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false }
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

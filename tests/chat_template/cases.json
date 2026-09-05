@@ -1,0 +1,9 @@
+[
+ {"messages":[{"role":"user","content":"hi"}]},
+ {"messages":[{"role":"user","content":"hi"}],"enable_thinking":false},
+ {"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"},
+ {"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"},
+ {"messages":[{"role":"system","content":"You are terse."},{"role":"user","content":"hi"}]},
+ {"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello","reasoning_content":"be brief"},{"role":"user","content":"again"}]},
+ {"messages":[{"role":"system","content":"You are terse."},{"role":"user","content":"weather?"},{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"get_weather","arguments":{"city":"Rome"}}}]},{"role":"tool","content":"{\"temp\": 19}"},{"role":"tool","content":"{\"temp\": 21}"},{"role":"user","content":"thanks"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{}}}]}
+]
