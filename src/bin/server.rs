@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
             .route("/v1/internal/model/info", web::get().to(http::model_info))
             .route("/v1/chat/completions", web::post().to(http::chat_completions))
             .route("/v1/completions", web::post().to(http::completions))
+            .route("/v1/responses", web::post().to(http::responses))
             .default_service(web::route().to(http::fallback))
     })
     .bind((host.as_str(), port))?

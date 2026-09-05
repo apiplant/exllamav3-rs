@@ -101,13 +101,14 @@ fn chunked_decode_matches_one_shot_prefill() {
     let all = Tensor::from_slice(&toks).view([1, -1]).to_device(dev);
     let n = toks.len() as i64;
 
+    // `prefill` advances the cache itself — advancing again here would put the
+    // decode steps at the wrong positions, which is exactly what it looks like
+    // when the model is broken.
     let one = PagedKvCache::new(&model.config, 512, dev);
     let want = model.prefill(&all, &one);
-    one.advance(n);
 
     let split = PagedKvCache::new(&model.config, 512, dev);
     let _ = model.prefill(&all.narrow(1, 0, n - 2), &split);
-    split.advance(n - 2);
     let mut got = None;
     for i in n - 2..n {
         got = Some(model.forward_paged(&all.narrow(1, i, 1), &split));

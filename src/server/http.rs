@@ -4,6 +4,7 @@ use crate::server::chat::{extract_tool_calls, render_chatml, ToolCall};
 use crate::server::config::ServerConfig;
 use crate::server::engine::{Chunk, EngineHandle, EngineRequest, GenStats, GrammarSpec};
 use crate::server::oai::{self, FinishReason};
+use crate::server::responses;
 use ntex::util::Bytes;
 use ntex::web::{self, HttpRequest, HttpResponse};
 use serde_json::{json, Value};
@@ -682,6 +683,322 @@ fn sse(v: &Value) -> Bytes {
     s.push_str(&serde_json::to_string(v).unwrap_or_default());
     s.push_str("\n\n");
     Bytes::from(s)
+}
+
+/// SSE frame with an explicit `event:` line, as the Responses API stream uses
+/// (Codex pairs the `event:` kind with the `data:` payload).
+fn sse_event(kind: &str, v: &Value) -> Bytes {
+    let mut s = String::from("event: ");
+    s.push_str(kind);
+    s.push_str("\ndata: ");
+    s.push_str(&serde_json::to_string(v).unwrap_or_default());
+    s.push_str("\n\n");
+    Bytes::from(s)
+}
+
+// --- POST /v1/responses (OpenAI Responses API, for Codex) -----------------
+
+pub async fn responses(
+    st: web::types::State<AppState>,
+    http_req: HttpRequest,
+    raw: Bytes,
+) -> HttpResponse {
+    if !authorized(&st, &http_req) {
+        return err_response(401, "missing or invalid API key", "authentication_error");
+    }
+    let body = match parse_body(&raw) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    if st.cfg.logging.log_requests {
+        crate::sinfo!("Request body: {}", serde_json::to_string(&body).unwrap_or_default());
+    }
+    let chat_body = match responses::to_chat_body(&body) {
+        Ok(b) => b,
+        Err(e) => return err_response(400, &e, "invalid_request_error"),
+    };
+
+    let t_recv = Instant::now();
+    let prep = match prepare(&st, &chat_body, true) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let Prepared { req, rx, cancel, stream, prompt_tokens, model_id, parse_tools, .. } = prep;
+
+    if st.eng.tx.send_async(req).await.is_err() {
+        return err_response(500, "engine unavailable", "server_error");
+    }
+
+    let id = oai::rand_id("resp");
+    let log_m = st.cfg.logging.log_chat_completion_requests;
+    if log_m {
+        crate::sinfo!("Received responses{} request {id}", if stream { " streaming" } else { "" });
+    }
+    let m = Metrics { id: id.clone(), t_recv, stream, is_chat: true, enabled: log_m };
+    let ping = st.cfg.network.sse_ping_interval.unwrap_or(15);
+
+    if stream {
+        responses_stream(rx, cancel, id, model_id, parse_tools, prompt_tokens, ping, m)
+    } else {
+        responses_buffered(rx, cancel, id, model_id, parse_tools, prompt_tokens, m).await
+    }
+}
+
+async fn responses_buffered(
+    rx: flume::Receiver<Chunk>,
+    cancel: Arc<AtomicBool>,
+    id: String,
+    model_id: String,
+    parse_tools: bool,
+    prompt_tokens: usize,
+    metrics: Metrics,
+) -> HttpResponse {
+    let _guard = CancelGuard(cancel);
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish = FinishReason::Stop;
+    let mut completion_tokens = 0usize;
+    let mut stats = GenStats::default();
+    let mut error: Option<String> = None;
+
+    while let Ok(c) = rx.recv_async().await {
+        match c {
+            Chunk::Content(s) => content.push_str(&s),
+            Chunk::Reasoning(s) => reasoning.push_str(&s),
+            Chunk::Done { finish: f, completion_tokens: n, stats: gs } => {
+                finish = f;
+                completion_tokens = n;
+                stats = gs;
+                break;
+            }
+            Chunk::Error(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = error {
+        return HttpResponse::Ok().json(&responses::response_failed(&id, &model_id, &e));
+    }
+
+    let mut tool_calls = Vec::new();
+    if parse_tools {
+        let (calls, cleaned) = extract_tool_calls(&content);
+        if !calls.is_empty() {
+            metrics.parsed_tools(calls.len());
+            tool_calls = calls;
+            content = cleaned;
+            finish = FinishReason::ToolCalls;
+        }
+    }
+    metrics.finish(Instant::now(), completion_tokens, &stats);
+
+    HttpResponse::Ok().json(&responses::response_object(
+        &id, &model_id, &content, &reasoning, &tool_calls, finish, prompt_tokens, completion_tokens,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn responses_stream(
+    rx: flume::Receiver<Chunk>,
+    cancel: Arc<AtomicBool>,
+    id: String,
+    model_id: String,
+    parse_tools: bool,
+    prompt_tokens: usize,
+    ping_secs: u64,
+    metrics: Metrics,
+) -> HttpResponse {
+    let s = async_stream::stream! {
+        let _guard = CancelGuard(cancel);
+        let msg_id = format!("msg_{id}");
+        let rs_id = format!("rs_{id}");
+        let mut seq: u64 = 0;
+        let mut ev = |kind: &str, mut v: Value| {
+            // Codex deserialises the `data:` JSON into a struct keyed by `type`;
+            // a missing `type` is a hard parse error ("stream disconnected
+            // before completion"). Keep it in the body as well as the `event:`
+            // line.
+            v["type"] = json!(kind);
+            v["sequence_number"] = json!(seq);
+            seq += 1;
+            sse_event(kind, &v)
+        };
+
+        yield Ok::<Bytes, io::Error>(ev(
+            "response.created",
+            json!({ "response": responses::response_skeleton(&id, &model_id) }),
+        ));
+
+        let mut full_content = String::new();
+        let mut emitted: usize = 0;
+        let mut reasoning_acc = String::new();
+        let mut msg_added = false;
+        let mut reason_added = false;
+        let mut reason_done = false;
+        let mut next_idx: u64 = 0;
+        let mut reason_idx: u64 = 0;
+        let mut msg_idx: u64 = 0;
+
+        let ping = if ping_secs > 0 { Some(Duration::from_secs(ping_secs)) } else { None };
+
+        loop {
+            let chunk = match ping {
+                Some(d) => {
+                    let recv = std::pin::pin!(rx.recv_async());
+                    let timer = std::pin::pin!(ntex::time::sleep(d));
+                    match futures_util::future::select(recv, timer).await {
+                        futures_util::future::Either::Left((Ok(c), _)) => c,
+                        futures_util::future::Either::Left((Err(_), _)) => break,
+                        futures_util::future::Either::Right(_) => {
+                            yield Ok(Bytes::from_static(b": ping\n\n"));
+                            continue;
+                        }
+                    }
+                }
+                None => match rx.recv_async().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                },
+            };
+            match chunk {
+                Chunk::Reasoning(t) => {
+                    reasoning_acc.push_str(&t);
+                    if !reason_added {
+                        reason_added = true;
+                        reason_idx = next_idx;
+                        next_idx += 1;
+                        yield Ok(ev("response.output_item.added", json!({
+                            "output_index": reason_idx,
+                            "item": { "type": "reasoning", "id": rs_id, "summary": [], "content": [] },
+                        })));
+                    }
+                    yield Ok(ev("response.reasoning_text.delta", json!({
+                        "item_id": rs_id, "output_index": reason_idx, "content_index": 0, "delta": t,
+                    })));
+                }
+                Chunk::Content(t) => {
+                    full_content.push_str(&t);
+                    let upto = if parse_tools {
+                        tool_safe_len(&full_content, false)
+                    } else {
+                        full_content.len()
+                    };
+                    if upto > emitted {
+                        if !msg_added {
+                            // close the reasoning item before the message opens
+                            if reason_added && !reason_done {
+                                reason_done = true;
+                                yield Ok(ev("response.output_item.done", json!({
+                                    "output_index": reason_idx,
+                                    "item": {
+                                        "type": "reasoning", "id": rs_id, "summary": [],
+                                        "content": [{ "type": "reasoning_text", "text": reasoning_acc }],
+                                    },
+                                })));
+                            }
+                            msg_added = true;
+                            msg_idx = next_idx;
+                            next_idx += 1;
+                            yield Ok(ev("response.output_item.added", json!({
+                                "output_index": msg_idx,
+                                "item": {
+                                    "type": "message", "id": msg_id, "role": "assistant",
+                                    "status": "in_progress", "content": [],
+                                },
+                            })));
+                        }
+                        let delta = full_content[emitted..upto].to_string();
+                        emitted = upto;
+                        yield Ok(ev("response.output_text.delta", json!({
+                            "item_id": msg_id, "output_index": msg_idx, "content_index": 0, "delta": delta,
+                        })));
+                    }
+                }
+                Chunk::Error(e) => {
+                    yield Ok(ev("response.failed", json!({
+                        "response": responses::response_failed(&id, &model_id, &e),
+                    })));
+                    return;
+                }
+                Chunk::Done { mut finish, completion_tokens, stats } => {
+                    let mut tool_calls: Vec<ToolCall> = Vec::new();
+                    let mut final_text = full_content.clone();
+                    if parse_tools {
+                        let (calls, cleaned) = extract_tool_calls(&full_content);
+                        if !calls.is_empty() {
+                            metrics.parsed_tools(calls.len());
+                            tool_calls = calls;
+                            finish = FinishReason::ToolCalls;
+                            final_text = cleaned;
+                        }
+                    }
+                    // flush any held-back prose before closing the message item
+                    if msg_added && final_text.len() > emitted {
+                        let delta = final_text[emitted..].to_string();
+                        yield Ok(ev("response.output_text.delta", json!({
+                            "item_id": msg_id, "output_index": msg_idx, "content_index": 0, "delta": delta,
+                        })));
+                    }
+                    if reason_added && !reason_done {
+                        yield Ok(ev("response.output_item.done", json!({
+                            "output_index": reason_idx,
+                            "item": {
+                                "type": "reasoning", "id": rs_id, "summary": [],
+                                "content": [{ "type": "reasoning_text", "text": reasoning_acc }],
+                            },
+                        })));
+                    }
+                    if msg_added {
+                        yield Ok(ev("response.output_item.done", json!({
+                            "output_index": msg_idx,
+                            "item": {
+                                "type": "message", "id": msg_id, "role": "assistant", "status": "completed",
+                                "content": [{ "type": "output_text", "text": final_text, "annotations": [] }],
+                            },
+                        })));
+                    }
+                    for (i, tc) in tool_calls.iter().enumerate() {
+                        let idx = next_idx;
+                        next_idx += 1;
+                        let item = json!({
+                            "type": "function_call",
+                            "id": format!("fc_{id}_{i}"),
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                            "status": "completed",
+                        });
+                        yield Ok(ev("response.output_item.added",
+                            json!({ "output_index": idx, "item": item })));
+                        yield Ok(ev("response.output_item.done",
+                            json!({ "output_index": idx, "item": item })));
+                    }
+                    metrics.finish(Instant::now(), completion_tokens, &stats);
+                    yield Ok(ev("response.completed", json!({
+                        "response": responses::response_object(
+                            &id, &model_id, &final_text, &reasoning_acc, &tool_calls,
+                            finish, prompt_tokens, completion_tokens,
+                        ),
+                    })));
+                    return;
+                }
+            }
+        }
+        // stream ended without a Done — emit a best-effort completion
+        yield Ok(ev("response.completed", json!({
+            "response": responses::response_object(
+                &id, &model_id, &full_content, &reasoning_acc, &[],
+                FinishReason::Stop, prompt_tokens, 0,
+            ),
+        })));
+    };
+
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .streaming(Box::pin(s))
 }
 
 // --- access log middleware ---------------------------------------------------

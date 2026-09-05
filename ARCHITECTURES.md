@@ -84,7 +84,7 @@ long: it is invisible until an architecture with an awkward GQA ratio shows up.
 | `Qwen3MoeForCausalLM` | ✅ Verified | MoE | Qwen3-30B-A3B-exl3-3.0bpw — **154 tok/s** |
 | `Qwen3_5MoeForCausalLM` | ❌ | MoE, GDN | hybrid + experts; not yet wired |
 | `Qwen3_5MoeForConditionalGeneration` | ❌ | MoE, GDN, Vision | |
-| `Qwen3VLForConditionalGeneration` | 🟡 Untested | Vision | Same tower as Qwen3.5 plus deepstack; Qwen3 block under `model.language_model`. Checkpoint downloading |
+| `Qwen3VLForConditionalGeneration` | 🟡 Untested | Vision | Same tower as Qwen3.5 plus deepstack; Qwen3 block under `model.language_model`. Runs on a synthetic checkpoint (`tests/qwen3vl_load.rs`); Qwen3-VL-8B 4.0bpw is downloaded and waiting on a free GPU |
 | `Qwen3VLMoeForConditionalGeneration` | 🟡 Untested | MoE, Vision | As above with the Qwen3-MoE block — both halves are verified separately, the pairing is not |
 | `Qwen3NextForCausalLM` | ❌ | MoE, GDN | |
 | `Qwen2_5_VLForConditionalGeneration` | ❌ | Vision | A genuinely different tower (windowed attention, its own merger), not the Qwen3-VL one |
@@ -226,8 +226,25 @@ getting it backwards is silent — `vision.rs` has a unit test that pins the ord
 a group-then-normalize reference.
 
 `Model::forward_paged_mm` is the non-hybrid multimodal forward, adding deepstack entry `i` to
-the residual ahead of block `i`. Qwen3.5 vision was re-run after the refactor and still
-describes a test image correctly.
+the residual ahead of block `i`; the hybrid stack takes the same argument, so a Qwen3.5-family
+checkpoint that ships deepstack indexes would work without further changes. Qwen3.5 vision was
+re-run after the refactor and still describes a test image correctly.
+
+`tests/qwen3vl_load.rs` covers the seam on a synthetic checkpoint: one deepstack block per
+configured index, distinct taps, logits that actually change when deepstack is supplied, and
+a no-deepstack forward that matches the plain paged one. Two things it caught immediately:
+
+- The first version of the fixture wrote **zero-weight** LayerNorms and RMSNorms. This port
+  adds a constant bias of 1.0 only where the architecture stores its norm weights
+  zero-centred (Qwen3.5, qwen4_exp); a Qwen3 RMSNorm and every vision LayerNorm use the
+  stored weight as-is, so zeros silently zeroed the entire model — and every check passed,
+  because zeros are finite and correctly shaped. The `Glm4Moe` fixture had the same defect,
+  which means its earlier "loads and forwards" result was worth much less than it looked.
+  All three fixtures now write realistic norm weights, and every fixture test asserts the
+  logits are non-trivial.
+- A double `cache.advance` in the `Glm4Moe` chunked-decode test, which looked exactly like a
+  model bug (57% relative divergence on a *single* layer) until the same weights were run
+  through the Qwen3 arch path and diverged identically.
 
 ## MoE decode: the multi-GEMM path
 
